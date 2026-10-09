@@ -1,0 +1,13 @@
+apiVersion: 1
+
+datasources:
+  - name: VictoriaMetrics
+    # The dashboards in infra/grafana/dashboards reference this exact uid.
+    uid: P4169E866C3094E38
+    type: prometheus
+    access: proxy
+    url: http://victoriametrics:8428
+    isDefault: true
+    editable: true
+    jsonData:
+      timeInterval: 5s

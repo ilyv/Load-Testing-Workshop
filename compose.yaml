@@ -1,0 +1,185 @@
+name: load-testing-workshop
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "2"
+
+services:
+  quickpizza:
+    <<: *logging
+    image: ghcr.io/grafana/quickpizza-local:${QUICKPIZZA_VERSION:-0.15.31}
+    container_name: quickpizza
+    restart: unless-stopped
+    environment:
+      QUICKPIZZA_DB: postgres://postgres:postgres@quickpizza-db:5432/quickpizza_db?sslmode=disable
+      QUICKPIZZA_ENABLE_ALL_SERVICES: "1"
+      QUICKPIZZA_LOG_LEVEL: ${QUICKPIZZA_LOG_LEVEL:-warn}
+    depends_on:
+      quickpizza-db:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "${QUICKPIZZA_CPUS:-0.5}"
+          memory: ${QUICKPIZZA_MEM:-192M}
+    networks: [workshop]
+
+  quickpizza-db:
+    <<: *logging
+    image: postgres:${POSTGRES_VERSION:-18.6}
+    container_name: quickpizza-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: quickpizza_db
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quickpizza_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "${DB_CPUS:-0.5}"
+          memory: ${DB_MEM:-256M}
+    networks: [workshop]
+
+  victoriametrics:
+    <<: *logging
+    image: victoriametrics/victoria-metrics:${VICTORIAMETRICS_VERSION:-v1.153.0}
+    restart: unless-stopped
+    command:
+      - -storageDataPath=/storage
+      - -retentionPeriod=30d
+      - -httpListenAddr=:8428
+      - -promscrape.config=/etc/victoriametrics/scrape.yml
+      - -search.latencyOffset=5s
+    volumes:
+      - vmdata:/storage
+      - ./infra/victoriametrics/scrape.yml:/etc/victoriametrics/scrape.yml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8428/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    deploy:
+      resources:
+        limits:
+          cpus: "${VICTORIAMETRICS_CPUS:-0.5}"
+          memory: ${VICTORIAMETRICS_MEM:-256M}
+    networks: [workshop]
+
+  grafana:
+    <<: *logging
+    image: grafana/grafana:${GRAFANA_VERSION:-13.2.3}
+    restart: unless-stopped
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/k6-prometheus-dashboard.json
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - grafanadata:/var/lib/grafana
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    deploy:
+      resources:
+        limits:
+          cpus: "${GRAFANA_CPUS:-0.25}"
+          memory: ${GRAFANA_MEM:-256M}
+    networks: [workshop]
+
+  telegraf:
+    <<: *logging
+    image: telegraf:${TELEGRAF_VERSION:-1.40.1-alpine}
+    restart: unless-stopped
+    user: "0:0"
+    entrypoint: ["telegraf"]
+    volumes:
+      - ./infra/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      victoriametrics:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "${TELEGRAF_CPUS:-0.1}"
+          memory: ${TELEGRAF_MEM:-96M}
+    networks: [workshop]
+
+  # The only container with a route outside: it publishes the UIs to the host.
+  # Everything else, k6 included, sits on the internal network without internet access.
+  proxy:
+    <<: *logging
+    image: nginx:${NGINX_VERSION:-1.30.4-alpine}
+    restart: unless-stopped
+    volumes:
+      - ./infra/proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${QUICKPIZZA_PORT:-3333}:3333"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${VICTORIAMETRICS_PORT:-8428}:8428"
+      - "127.0.0.1:${K6_DASHBOARD_PORT:-5665}:5665"
+    deploy:
+      resources:
+        limits:
+          cpus: "${PROXY_CPUS:-0.1}"
+          memory: ${PROXY_MEM:-32M}
+    networks: [workshop, host-access]
+
+  # No resource limits on purpose: the load generator must never be the bottleneck.
+  # No depends_on either: `compose run` would recreate QuickPizza and drop compose.faults.yaml.
+  k6:
+    image: grafana/k6:${K6_VERSION:-2.3.0}
+    profiles: ["k6"]
+    user: "0:0"
+    entrypoint: ["sh", "/entrypoint.sh"]
+    command: ["01-smoke.js"]
+    working_dir: /scripts
+    environment:
+      BASE_URL: ${BASE_URL:-http://quickpizza:3333}
+      K6_OUT: experimental-prometheus-rw
+      K6_PROMETHEUS_RW_SERVER_URL: http://victoriametrics:8428/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: p(50),p(95),p(99),min,max
+      K6_PROMETHEUS_RW_PUSH_INTERVAL: 5s
+      K6_WEB_DASHBOARD: "true"
+      K6_WEB_DASHBOARD_HOST: 0.0.0.0
+      K6_WEB_DASHBOARD_PORT: "5665"
+      K6_SUMMARY_TREND_STATS: min,avg,med,max,p(90),p(95),p(99)
+      K6_NO_USAGE_REPORT: "true"
+    volumes:
+      - ./tests:/scripts:ro
+      - ./results:/results
+      - ./infra/k6/entrypoint.sh:/entrypoint.sh:ro
+    networks: [workshop]
+
+volumes:
+  pgdata: {}
+  vmdata: {}
+  grafanadata: {}
+
+networks:
+  workshop:
+    internal: true
+  host-access: {}
